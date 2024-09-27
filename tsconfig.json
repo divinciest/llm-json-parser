@@ -1,0 +1,20 @@
+{
+    "compilerOptions": {
+      "esModuleInterop": true,          // Ensures compatibility with ES modules and CommonJS
+      "forceConsistentCasingInFileNames": true,  // Enforces consistent casing for file names
+      "skipLibCheck": true,             // Skip type checking for .d.ts files
+      "target": "es2019",               // Target ES2019 for modern features
+      "lib": ["es2019", "dom"],         // Use ES2019 and DOM (if necessary) to support modern JS features
+      "module": "commonjs",             // CommonJS module system (can be "esnext" if you need ES modules)
+      "strict": false,                  // Disable strict type checking options (you can enable based on preference)
+      "noImplicitAny": false,           // Allow variables to implicitly have 'any' type
+      "declaration": true,              // Generate .d.ts declaration files
+      "declarationMap": true,           // Generate source maps for declaration files
+      "emitDeclarationOnly": false,     // Emit both .js and .d.ts files
+      "outDir": "./dist",               // Output compiled files to dist folder
+      "moduleResolution": "node"        // Use Node.js-style module resolution
+    },
+    "include": ["*.ts", "src/index.ts"],         // Include all TypeScript files in src directory
+    "exclude": ["node_modules", "dist"] // Exclude node_modules and dist from compilation
+  }
+  

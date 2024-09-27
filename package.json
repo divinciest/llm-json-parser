@@ -1,0 +1,38 @@
+{
+  "name": "llm-json-parser",
+  "version": "1.0.0",
+  "description": "LLM JSON Parser is a groundbreaking TypeScript library designed to parse and reconstruct even the most severely broken JSON data using a predefined schema ( useful to parse json output by LLM ). This library pushes the limits of what is possible in JSON parsing, capable of extracting meaningful data from severely damaged JSON strings that would be unreadable by conventional parsers.",
+  "main": "dist/index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "npx tsc"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/divinciest/llm-json-parser.git"
+  },
+  "keywords": [
+    "llm",
+    "json",
+    "parsing",
+    "ai",
+    "data",
+    "output"
+  ],
+  "author": "divinciest ( dhia hassen )",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/divinciest/llm-json-parser/issues"
+  },
+  "homepage": "https://github.com/divinciest/llm-json-parser#readme",
+  "dependencies": {
+    "lodash": "^4.17.21",
+    "really-relaxed-json": "^0.3.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.2"
+  },
+  "files": [
+    "dist/"
+  ]
+}
