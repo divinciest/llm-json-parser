@@ -22,7 +22,11 @@ Features
 Quick Start
 -----------
 
-Here’s how to quickly get started with the LLM JSON Parser:
+To install the LLM JSON Parser, run the following command:
+
+    npm install llm-json-parser
+
+You can start with this example:
 
     
     import { parseJSON } from './llm-json-parser';
