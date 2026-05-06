@@ -14,7 +14,7 @@
       "outDir": "./dist",               // Output compiled files to dist folder
       "moduleResolution": "node"        // Use Node.js-style module resolution
     },
-    "include": ["*.ts", "src/index.ts"],         // Include all TypeScript files in src directory
+    "include": ["src/index.ts"],         // Include all TypeScript files in src directory
     "exclude": ["node_modules", "dist"] // Exclude node_modules and dist from compilation
   }
   

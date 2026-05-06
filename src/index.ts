@@ -282,14 +282,223 @@ function getAncestorArrayPath(path, schema) {
 
 
 
-function prepareJson(jsonString) {// insert new line after every "{" , "}" ,"," , "[" , "]"
+function repairUnescapedQuotes(jsonString, schema) {
+    // Extract all known field names from the schema so we can detect structural boundaries
+    const knownKeys = new Set<string>();
+    function collectKeys(obj) {
+        if (typeof obj !== 'object' || obj === null) return;
+        for (const key in obj) {
+            knownKeys.add(key);
+            if (Array.isArray(obj[key])) {
+                if (obj[key].length > 0 && typeof obj[key][0] === 'object') collectKeys(obj[key][0]);
+            } else if (typeof obj[key] === 'object') {
+                collectKeys(obj[key]);
+            }
+        }
+    }
+    collectKeys(schema);
+    // Also add JSON structural keywords
+    knownKeys.add('true'); knownKeys.add('false'); knownKeys.add('null');
+
+    // Build a regex that matches known key patterns that would follow a string value ending:
+    //   ", "knownKey":    or   "}   or   }]   or   }]}   etc.
+    // These patterns indicate the REAL end of a string value.
+    const keyPattern = Array.from(knownKeys).map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+
+    // Strategy: walk character by character tracking state.
+    // When we're inside a string value (not a key), check if a quote is followed by
+    // something that looks like a continuation of the string (not a structural delimiter).
+    // If so, escape it.
+
+    let result = '';
+    let i = 0;
+    const len = jsonString.length;
+
+    // State
+    let inString = false;
+    let stringIsKey = false; // true if this string is a JSON key (before the colon)
+    let escaped = false;
+    let depth = 0; // brace/bracket depth when we entered the current string value
+
+    // Track whether we expect a key or value
+    // After { or , inside an object: expect key
+    // After : expect value
+    let expectKey = false;
+    let contextStack: boolean[] = []; // stack of "are we in an object?" flags
+
+    while (i < len) {
+        const ch = jsonString[i];
+
+        if (inString) {
+            if (escaped) {
+                result += ch;
+                escaped = false;
+                i++;
+                continue;
+            }
+            if (ch === '\\') {
+                result += ch;
+                escaped = true;
+                i++;
+                continue;
+            }
+            if (ch === '"') {
+                if (stringIsKey) {
+                    // Keys are short and well-formed — just close the string
+                    result += ch;
+                    inString = false;
+                    i++;
+                    continue;
+                }
+                // This is a quote inside a VALUE string. Is it the real end?
+                // Look ahead to see if what follows is structurally valid JSON
+                const ahead = jsonString.substring(i + 1, i + 200).trimStart();
+                if (isStructuralFollow(ahead, keyPattern)) {
+                    // Real end of string
+                    result += ch;
+                    inString = false;
+                    i++;
+                    continue;
+                } else {
+                    // Unescaped quote inside string content — escape it
+                    result += '\\"';
+                    i++;
+                    continue;
+                }
+            }
+            result += ch;
+            i++;
+            continue;
+        }
+
+        // Not in string
+        if (ch === '"') {
+            inString = true;
+            stringIsKey = expectKey;
+            result += ch;
+            i++;
+            continue;
+        }
+        if (ch === '{') {
+            contextStack.push(true); // entering object
+            expectKey = true;
+            result += ch;
+            i++;
+            continue;
+        }
+        if (ch === '[') {
+            contextStack.push(false); // entering array
+            expectKey = false;
+            result += ch;
+            i++;
+            continue;
+        }
+        if (ch === '}' || ch === ']') {
+            contextStack.pop();
+            // After closing, the parent context determines expectation
+            expectKey = false; // will be set by next , or : etc.
+            result += ch;
+            i++;
+            continue;
+        }
+        if (ch === ':') {
+            expectKey = false; // after colon we expect a value
+            result += ch;
+            i++;
+            continue;
+        }
+        if (ch === ',') {
+            // After comma: if we're in an object, expect key; if array, expect value
+            const inObject = contextStack.length > 0 && contextStack[contextStack.length - 1];
+            expectKey = !!inObject;
+            result += ch;
+            i++;
+            continue;
+        }
+        result += ch;
+        i++;
+    }
+
+    return result;
+}
+
+function isStructuralFollow(ahead: string, keyPattern: string): boolean {
+    let pos = 0;
+    const len = ahead.length;
+
+    function skipWs() {
+        while (pos < len && (ahead[pos] === ' ' || ahead[pos] === '\t' || ahead[pos] === '\r' || ahead[pos] === '\n')) pos++;
+    }
+
+    function validatePostValue(): boolean {
+        skipWs();
+        if (pos >= len) return true;
+        const c = ahead[pos];
+        if (c === '}' || c === ']') {
+            pos++;
+            return validatePostClose();
+        }
+        if (c === ',') {
+            pos++;
+            return validatePostComma();
+        }
+        return false;
+    }
+
+    function validatePostClose(): boolean {
+        skipWs();
+        if (pos >= len) return true;
+        const c = ahead[pos];
+        if (c === '}' || c === ']') { pos++; return validatePostClose(); }
+        if (c === ',') { pos++; return validatePostComma(); }
+        return false;
+    }
+
+    function validatePostComma(): boolean {
+        skipWs();
+        if (pos >= len) return true;
+        if (ahead[pos] === '}' || ahead[pos] === ']') return true;
+        if (ahead[pos] === '{' || ahead[pos] === '[') return true;
+        if (ahead[pos] === '"') {
+            const rest = ahead.substring(pos);
+            const m = rest.match(/^"([^"]*?)"\s*:/);
+            if (m && knownKeysSetGlobal && knownKeysSetGlobal.has(m[1])) return true;
+        }
+        if (/^(true|false|null|-?\d)/.test(ahead.substring(pos))) return true;
+        return false;
+    }
+
+    return validatePostValue();
+}
+
+// Global ref so isStructuralFollow can access it (set during repairUnescapedQuotes)
+let knownKeysSetGlobal: Set<string> | null = null;
+
+function prepareJson(jsonString, schema?) {
+    if (schema) {
+        knownKeysSetGlobal = new Set<string>();
+        function collectKeysG(obj) {
+            if (typeof obj !== 'object' || obj === null) return;
+            for (const key in obj) {
+                knownKeysSetGlobal.add(key);
+                if (Array.isArray(obj[key])) {
+                    if (obj[key].length > 0 && typeof obj[key][0] === 'object') collectKeysG(obj[key][0]);
+                } else if (typeof obj[key] === 'object') {
+                    collectKeysG(obj[key]);
+                }
+            }
+        }
+        collectKeysG(schema);
+
+        try {
+            JSON.parse(jsonString);
+        } catch {
+            jsonString = repairUnescapedQuotes(jsonString, schema);
+        }
+
+        knownKeysSetGlobal = null;
+    }
     jsonString = jsonString.replace(/([{}:,[])/g, "$1\n");
-    // remove any number of white spaces between each " and next :
-    // jsonString = jsonString.replace(/\s*:\s*/g, ":");
-    // insert new line just before every string between quotes followed by : 
-    // jsonString = jsonString.replace(/"([^"]+)"\s*:/g, '"$1"\n:');
-
-
     return jsonString;
 }
 // change function to to insert new line after every , or opening or closing bracket or curly brackets
@@ -794,9 +1003,36 @@ export function parseJSON(jsonString, schema,
     // 8. convert to json shape
     // 9. map every result object to schema case if needed
     // 10 . parse values by leaf node type and replace string of linw with value
-    // START 
+    // START
+    // 0. Fast path: if JSON.parse succeeds (or repair makes it valid), return directly
+    try {
+        const parsed = JSON.parse(jsonString);
+        return { allResults: [{ result: parsed }] };
+    } catch {
+        if (schema) {
+            knownKeysSetGlobal = new Set<string>();
+            function collectKeysForRepair(obj) {
+                if (typeof obj !== 'object' || obj === null) return;
+                for (const key in obj) {
+                    knownKeysSetGlobal.add(key);
+                    if (Array.isArray(obj[key])) {
+                        if (obj[key].length > 0 && typeof obj[key][0] === 'object') collectKeysForRepair(obj[key][0]);
+                    } else if (typeof obj[key] === 'object') {
+                        collectKeysForRepair(obj[key]);
+                    }
+                }
+            }
+            collectKeysForRepair(schema);
+            const repaired = repairUnescapedQuotes(jsonString, schema);
+            knownKeysSetGlobal = null;
+            try {
+                const parsed = JSON.parse(repaired);
+                return { allResults: [{ result: parsed }] };
+            } catch {}
+        }
+    }
     // 1. preprocess json and schema
-    jsonString = prepareJson(jsonString)
+    jsonString = prepareJson(jsonString, schema)
     let [originalSchema, processedSchema] = prepareSchema(schema, caseInsensitive)
     schema = processedSchema
     // 2. predict lines attributes
