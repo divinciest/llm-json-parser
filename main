@@ -1,0 +1,1106 @@
+import re
+import json
+from typing import Dict, List, Tuple, Any, Union, Optional, Set
+import copy
+
+# we leverage these things
+
+# the fact that we are most of the time interested only in a subset of all possible JSONs when using LLMS
+# because we praticaally dont want schema to be so complex
+
+# the fact that we accept to have some data over no data in case of broken JSONs
+
+# the fact that we know the schema of the JSON
+
+# most common mistakes are irrelavant to data labeling
+
+# all what you need to understand a standard JSON is label
+
+# library doesnt support yet "2d arrays" of objects with deep attributes in which you cant formulate a unique path x.y.z[i] it supports arrays indexing only at last level and only if no ancestor array
+
+def predict_lines_attributes(json_string: str, schema: Dict, case_insensitive: bool = False, best_match_attribute: bool = False) -> Tuple[List[Tuple[str, str]], List[str]]:
+    lines = json_string.split('\n')
+    result = []
+    # unique set of attribute names
+    attributes = set()
+
+    # Extract all possible attributes from schema
+    possible_attributes = extract_attributes_from_schema(schema)
+    # sort by length longest first
+    
+    def is_property_name(line: str) -> bool:
+        return bool(re.match(r'^\s*["\'][^"\']+["\']\s*:', line))
+
+    def extract_property_name(line: str) -> Optional[str]:
+        match = re.match(r'^\s*["\']([^"\']+)["\']\s*:', line)
+        return match.group(1) if match else None
+
+    def find_best_match(line: str, possible_attributes: List[str], case_insensitive: bool) -> Optional[str]:
+        search_line = line.lower() if case_insensitive else line
+
+        for attr in possible_attributes:
+            # Ensure attr is a string before calling lower()
+            str_attr = str(attr) if not isinstance(attr, str) else attr
+            search_attr = str_attr.lower() if case_insensitive else str_attr
+            regex = re.compile(r'\b' + re.escape(search_attr) + r'\b')
+            if regex.search(search_line):
+                return str_attr
+        return None
+
+    for line in lines:
+        line = line.strip()
+        attribute_name = ''
+
+        if is_property_name(line):
+            attribute_name = extract_property_name(line) or ''
+
+        if not attribute_name and best_match_attribute:
+            attribute_name = find_best_match(line, possible_attributes, case_insensitive) or ''
+
+        if case_insensitive:
+            attribute_name = attribute_name.lower()
+
+        attributes.add(attribute_name)
+        result.append((line, attribute_name))
+
+    # remove "" from attributes set
+    if '' in attributes:
+        attributes.remove('')
+
+    return result, list(attributes)
+
+
+def extract_attributes_from_schema(schema: Dict) -> List[str]:
+    attributes = []
+
+    def traverse(obj):
+        if isinstance(obj, dict):
+            for key in obj:
+                # Ensure key is a string before adding to attributes
+                str_key = str(key) if not isinstance(key, str) else key
+                attributes.append(str_key)
+                if isinstance(obj[key], (dict, list)):
+                    traverse(obj[key])
+        elif isinstance(obj, list) and obj:
+            traverse(obj[0])
+
+    traverse(schema)
+    return list(set(attributes))  # Remove duplicates 
+
+# Now this function should correctly manage all data types and maintain proper types in results.
+def get_all_paths(schema: Dict, current_path: str = '') -> List[str]:
+    paths = []
+
+    # Verify schema is an object and iterate over its keys
+    if isinstance(schema, dict) and schema is not None:
+        for key in schema:
+            # Construct the path for this key
+            new_path = f"{current_path}.{key}" if current_path else key
+
+            # Add every path, including those for objects
+            paths.append(new_path)
+
+            # Get the value at the current key in the schema
+            value = schema[key]
+
+            # If the value is an object and not an array of primitives, recurse into it
+            if isinstance(value, (dict, list)) and value is not None:
+                if isinstance(value, list):
+                    if len(value) > 0 and isinstance(value[0], dict):
+                        # If it's an array of objects, recurse with the first object
+                        paths.extend(get_all_paths(value[0], new_path))
+                else:
+                    # Recurse directly for non-array objects
+                    paths.extend(get_all_paths(value, new_path))
+
+    return paths
+
+
+def map_object_to_schema_case(obj: Any, schema: Dict) -> Any:
+    if not isinstance(obj, (dict, list)) or obj is None:
+        return obj
+
+    result = [] if isinstance(obj, list) else {}
+
+    for schema_key in schema:
+        # Ensure schema_key is a string before calling lower()
+        str_schema_key = str(schema_key) if not isinstance(schema_key, str) else schema_key
+        lower_schema_key = str_schema_key.lower()
+        schema_value = schema[schema_key]
+
+        for obj_key in obj:
+            # Ensure obj_key is a string before calling lower()
+            str_obj_key = str(obj_key) if not isinstance(obj_key, str) else obj_key
+            if str_obj_key.lower() == lower_schema_key:
+                value = obj[obj_key]
+
+                if isinstance(schema_value, list):
+                    # Handle array types
+                    if isinstance(value, list):
+                        result[schema_key] = [map_object_to_schema_case(item, schema_value[0]) for item in value]
+                    else:
+                        result[schema_key] = value
+                elif isinstance(schema_value, dict) and schema_value is not None:
+                    # Recursive call for nested objects
+                    result[schema_key] = map_object_to_schema_case(value, schema_value)
+                else:
+                    # Handle primitive types and strings
+                    result[schema_key] = value
+
+                break
+
+    return result
+
+
+def map_paths_to_full_family(paths: List[str], schema: Dict) -> Dict[str, List[str]]:
+    path_map = {}
+
+    for path in paths:
+        # Initialize an array for storing related paths
+        path_map[path] = []
+
+        # Find immediate children
+        children = [p for p in paths if p.startswith(path + ".") and len(p.split('.')) == len(path.split('.')) + 1]
+        path_map[path].extend(children)
+
+        # Find immediate siblings
+        parent_path = path[:path.rfind('.')]
+        siblings = [p for p in paths if p != path and p[:p.rfind('.')] == parent_path]
+        path_map[path].extend(siblings)
+
+        # Recursively find all siblings of each ancestor up to the root
+        current_parent_path = parent_path
+        while current_parent_path:
+            grand_parent_path = current_parent_path[:current_parent_path.rfind('.')]
+            parent_siblings = [p for p in paths if p != current_parent_path and p[:p.rfind('.')] == grand_parent_path]
+            path_map[path].extend(parent_siblings)
+            current_parent_path = grand_parent_path  # Move up to the next level
+        
+        # if this is in an array add self
+        if has_array_ancestor(path, schema):  # to do , this is the case if your immediate parent in insaide an array
+            path_map[path].append(path)
+
+    return path_map
+
+
+def build_path_predictions_mapping(schema: Dict) -> Dict[str, Dict[str, List[str]]]:
+    """
+    Builds a mapping for every possible current dot-path + encountered attribute to all possible dot-path prediction choices.
+
+    Args:
+        schema: The schema defining the structure.
+    
+    Returns:
+        The mapping of attribute paths to related paths.
+    """
+    all_paths = get_all_paths(schema)  # Get all possible paths in the schema
+    path_map = map_paths_to_full_family(all_paths, schema)  # Each path is mapped to its immediate 
+    # children and siblings and all siblings of each ancestor up to the root
+    # this is mapping of path -> relatedPaths is useful to know every time an attribute is encountered during parsing
+    # what is the possible path it you be in at that point
+    attribute_map = {}
+
+    root_attribute_names = []
+    for path, related_paths in path_map.items():  # For every path and its corresponding related paths
+        if '.' not in path:  # is this in root?
+            root_attribute_names.append(path)
+        
+        # Get the attribute name from the current path
+        related_attribute_names = [(p[p.rfind('.') + 1:], p) for p in related_paths]  # All possible attributes one can encounter just before or just after the current path in json
+        map_attribute_to_path = {}
+        for attribute_name, path_ in related_attribute_names:
+            if attribute_name in map_attribute_to_path:
+                # Insert at appropriate position based on depth
+                depth = len(path_.split('.'))
+                insert_index = 0
+                for i, existing_path in enumerate(map_attribute_to_path[attribute_name]):
+                    if len(existing_path.split('.')) > depth:
+                        insert_index = i + 1
+                        break
+                map_attribute_to_path[attribute_name].insert(insert_index, path_)
+            else:
+                map_attribute_to_path[attribute_name] = [path_]
+        
+        # Store in the map
+        attribute_map[path] = map_attribute_to_path
+
+    attribute_map[''] = {name: [name] for name in root_attribute_names}
+
+    return attribute_map
+
+
+def get_schema_at_path(schema: Dict, path: str) -> Any:
+    parts = path.split('.')
+    current = schema
+    for part in parts:
+        if current and isinstance(current, dict) and part in current:
+            current = current[part]
+        else:
+            return None
+    return current
+
+
+def get_ancestor_array_path(path: str, schema: Dict) -> str:
+    parts = path.split('.')
+    current_path = ''
+    for i in range(len(parts)):
+        if i > 0:
+            current_path += '.'
+        current_path += parts[i]
+        schema_at_path = get_schema_at_path(schema, current_path)
+        # LOG({ schemaAtPath, currentPath, constructorName: schemaAtPath?.constructor?.name });
+        if schema_at_path is list or (isinstance(schema_at_path, list)):
+            return current_path
+        # else:
+        #     LOG(f"Path {current_path} is of type {type(schema_at_path)}")
+    return ""
+
+
+def prepare_json(json_string: str) -> str:
+    """insert new line after every "{" , "}" ,"," , "[" , "]" """
+    json_string = re.sub(r'([{},\[\]])', r'\1\n', json_string)
+    # remove any number of white spaces between each " and next :
+    # json_string = re.sub(r'\s*:\s*', ':', json_string)
+    return json_string 
+
+def has_array_ancestor(path: str, schema: Dict) -> bool:
+    parts = path.split('.')
+    current_path = ''
+    for i in range(len(parts)):
+        if i > 0:
+            current_path += '.'
+        current_path += parts[i]
+        schema_at_path = get_schema_at_path(schema, current_path)
+        # LOG({ schemaAtPath, currentPath, constructorName: schemaAtPath?.constructor?.name });
+        if schema_at_path is list or isinstance(schema_at_path, list):
+            return True
+        # else:
+        #     LOG(f"Path {current_path} is of type {type(schema_at_path)}")
+    return False
+
+
+def loose_string_array_parser(input_string: str, array_name: str) -> Optional[List[str]]:
+    primary_parser_result = primary_parser(input_string, array_name)
+    if primary_parser_result:
+        if not (isinstance(primary_parser_result, list) and len(primary_parser_result) > 1
+                and isinstance(primary_parser_result[0], str)):  # it is not an array of strings
+            if hasattr(primary_parser_result, '__str__'):
+                primary_parser_result = [str(primary_parser_result)]
+            else:
+                primary_parser_result = None
+    if primary_parser_result:
+        return primary_parser_result
+    
+    # Remove potential array name at the very beginning
+    input_string = re.sub(f'^{re.escape(array_name)}\\s*=?\\s*', '', input_string)
+
+    def filter_out_array_name_from_result_array(arr):  # remove item if it is the array name
+        # return [item for item in arr if item != array_name]
+        return [item for i, item in enumerate(arr) if i != 0 or item.lower() != array_name.lower()]
+
+    # Function to extract strings between quotes
+    def extract_quoted_strings(string: str, quote_char: str) -> List[str]:
+        regex = re.compile(f'{quote_char}((?:\\\\.|[^{quote_char}\\\\])*){quote_char}')
+        matches = regex.findall(string)
+        return filter_out_array_name_from_result_array(matches)
+
+    # Function to calculate score
+    def calculate_score(arr: List[str]) -> int:
+        score = 0
+        for string in arr:
+            alpha_matches = re.findall(r'[a-z]', string.lower())
+            score = max(score, 1) * len(alpha_matches)
+        return score
+
+    # Extract strings with original quotes
+    double_quoted = extract_quoted_strings(input_string, '"')
+    single_quoted = extract_quoted_strings(input_string, "'")
+
+    # Remove first quote, then extract again
+    stripped_input = re.sub(r'^[\'"]', '', input_string)
+    stripped_double_quoted = extract_quoted_strings(stripped_input, '"')
+    stripped_single_quoted = extract_quoted_strings(stripped_input, "'")
+
+    # Combine all extracted arrays
+    all_arrays = [double_quoted, single_quoted, stripped_double_quoted, stripped_single_quoted]
+
+    # Calculate scores and find the best array
+    best_array = []
+    best_score = 0
+
+    for arr in all_arrays:
+        if len(arr) > 0:
+            score = calculate_score(arr)
+            if score > best_score:
+                best_score = score
+                best_array = arr
+
+    return best_array
+
+
+def loose_number_parser(input_string: str, name: str, known_attributes: List[str]) -> Optional[float]:
+    primary_parser_result = primary_parser(input_string, name)
+    value = None
+    if primary_parser_result:
+        value = primary_parser_result
+        # parseInt or ParseFloat
+        if isinstance(value, str):
+            try:
+                value = float(value)
+            except (ValueError, TypeError):
+                value = None
+    if value is not None:
+        return value
+    
+    # Escape special regex characters in the name
+    escaped_name = re.escape(name)
+
+    # Create a regex that matches both quoted and unquoted names, followed by a number
+    regex = re.compile(f'(?:"{escaped_name}"|{escaped_name})\\s*[:=]?\\s*(-?\\d+(?:\\.\\d+)?)', re.IGNORECASE)
+
+    match = regex.search(input_string)
+    if match:
+        return float(match.group(1))
+
+    return None
+
+
+def loose_boolean_parser(input_string: str, name: str, known_attributes: List[str]) -> Optional[bool]:
+    primary_parser_result = primary_parser(input_string, name)
+    if primary_parser_result is not None:
+        return str(primary_parser_result).lower() == 'true'
+    
+    # Convert the entire input string to lowercase
+    lowercase_input = input_string.lower()
+
+    # Find the positions of 'true' and 'false' in the lowercase input
+    true_index = lowercase_input.find('true')
+    false_index = lowercase_input.find('false')
+
+    # If both 'true' and 'false' are found, return the one that appears first
+    if true_index != -1 and false_index != -1:
+        return true_index < false_index
+
+    # If only 'true' is found, return true
+    if true_index != -1:
+        return True
+
+    # If only 'false' is found, return false
+    if false_index != -1:
+        return False
+
+    # If neither 'true' nor 'false' is found, return null
+    return None
+
+
+def primary_parser(input_string: str, name: str) -> Any:
+    try:
+        parse_result = best_match_object_access(parse_relaxed_json(input_string), name)
+        if parse_result is not None:
+            return parse_result
+    except Exception:
+        pass
+    return None
+
+
+def levenshtein_distance(a: str, b: str) -> int:
+    if len(a) == 0:
+        return len(b)
+    if len(b) == 0:
+        return len(a)
+
+    matrix = []
+
+    for i in range(len(b) + 1):
+        matrix.append([i])
+
+    for j in range(len(a) + 1):
+        matrix[0].append(j)
+
+    for i in range(1, len(b) + 1):
+        for j in range(1, len(a) + 1):
+            if b[i - 1] == a[j - 1]:
+                matrix[i].append(matrix[i - 1][j - 1])
+            else:
+                matrix[i].append(min(
+                    matrix[i - 1][j - 1] + 1,
+                    matrix[i][j - 1] + 1,
+                    matrix[i - 1][j] + 1
+                ))
+
+    return matrix[len(b)][len(a)]
+
+
+def trim_and_surround_with_brackets(string: str) -> str:
+    # Trim leading characters until a single or double quote is found
+    start = 0
+    while start < len(string) and string[start] not in ['"', "'"]:
+        start += 1
+
+    # Trim trailing characters until a comma, single or double quote is found
+    end = len(string) - 1
+    while end >= 0 and string[end] not in ['"', "'", ',']: 
+        end -= 1
+
+    # Remove the comma if it's the last character
+    if end >= 0 and string[end] == ',':
+        end -= 1
+
+    # Extract the trimmed substring
+    trimmed_str = string[start:end + 1]
+
+    # Surround the trimmed string with curly brackets if not already present
+    if not trimmed_str.startswith('{'):
+        trimmed_str = '{' + trimmed_str
+    if not trimmed_str.endswith('}'):
+        trimmed_str = trimmed_str + '}'
+
+    return trimmed_str
+
+
+def loose_string_parser(input_string: str, name: str, known_attributes: List[str]) -> Optional[str]:
+    # prepare input by triming sides until single or double quotes are found
+    input_string = trim_and_surround_with_brackets(input_string)
+    primary_parser_result = primary_parser(input_string, name)
+    if primary_parser_result is not None:
+        return '' if primary_parser_result in ['""', "''"] else primary_parser_result
+    
+    # Escape special regex characters in the name
+    escaped_name = re.escape(name)
+
+    # Create a regex that matches both quoted and unquoted names
+    # const regex = new RegExp(`(?:"${escapedName}"|${escapedName})\\s*:?\\s*(?:["'](.+?)["']|([^\\s,]+))`, 'i');
+    regex = re.compile(r'(["\'])(?:(?=(\\?))\2.)*?\1')
+
+    matches = []
+    for match in regex.finditer(input_string):
+        matches.append(match.group(0)[1:-1])  # Remove the quotes from the match
+
+    # filterout all known attributes
+    matches = [match for match in matches if match not in known_attributes and match.lower() not in [attr.lower() for attr in known_attributes]]
+
+    # return first non empty match, otherwise empty string if there is any match
+    for match in matches:
+        if match and len(match) > 0:
+            return match
+    
+    if len(matches) > 0:
+        return ''
+
+    return None 
+
+def map_js_type_to_string(type_obj: Any) -> str:
+    # type can be String , Number , Boolean , [String] , [Number] , [Boolean] , [Object] , [Array]
+    if type_obj is None:
+        return 'undefined'
+    if isinstance(type_obj, list):
+        if len(type_obj) == 0:
+            return 'Array'
+        else:
+            return f'[{map_js_type_to_string(type_obj[0])}]'
+    if isinstance(type_obj, dict):
+        return 'Object'
+    if type_obj is str:
+        return 'String'
+    if type_obj is int or type_obj is float:
+        return 'Number'
+    if type_obj is bool:
+        return 'Boolean'
+    if hasattr(type_obj, '__name__'):
+        return type_obj.__name__
+    return 'unknown'
+
+
+def extract_type_from_schema(schema: Dict, path: str) -> str:
+    # Takes in :
+    # schema : object with leaf nodes value being one of these String , Number , Boolean , [String] , [Number] , [Boolean] , [Object] , [Array]
+    # path : dot seperated path ( without array index )
+    segments = path.split('.')
+    for i in range(len(segments)):
+        if isinstance(schema, list):
+            if len(schema) == 0:
+                return 'undefined'
+            schema = schema[0]
+        if segments[i] not in schema:
+            return 'undefined'
+        schema = schema[segments[i]]
+    return map_js_type_to_string(schema)
+
+
+def get_js_type_parser(type_str: str):
+    # switch type return parser function 
+    parsers = {
+        'String': loose_string_parser,
+        'Number': loose_number_parser,
+        'Boolean': loose_boolean_parser,
+        '[String]': loose_string_array_parser,
+    }
+    return parsers.get(type_str)
+
+
+def parse_relaxed_json(input_string: str) -> Any:
+    # Simple relaxed JSON parser - this is a simplified version
+    # In the actual TypeScript version, they use really-relaxed-json library
+    try:
+        # First try standard JSON parsing
+        return json.loads(input_string)
+    except json.JSONDecodeError:
+        try:
+            # Try to fix common issues
+            # Replace single quotes with double quotes
+            fixed = input_string.replace("'", '"')
+            # Add quotes around unquoted keys
+            fixed = re.sub(r'(\w+):', r'"\1":', fixed)
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            # If all else fails, return empty dict
+            return {}
+
+
+def best_match_object_access(obj: Dict, key: str, case_insensitive: bool = False, search_in_keys: bool = False) -> Any:
+    if not isinstance(obj, dict):
+        return None
+        
+    best_match = None
+    best_score = float('inf')
+
+    for obj_key in obj:
+        # Ensure obj_key is a string before using in levenshtein_distance
+        str_obj_key = str(obj_key) if not isinstance(obj_key, str) else obj_key
+        distance = levenshtein_distance(key, str_obj_key)
+        score = distance / max(len(key), len(str_obj_key))
+
+        if score < best_score:
+            best_score = score
+            best_match = obj_key
+
+    result = obj[best_match] if best_score <= 0.30 else None
+    if result is not None:
+        return result
+    
+    low_case_key = key.lower()
+    if low_case_key != key:
+        no_case_result = best_match_object_access(obj, low_case_key)
+        if no_case_result is not None:
+            return no_case_result
+    
+    if case_insensitive:
+        cpy = {}
+        for obj_key in obj:
+            if isinstance(obj_key, str):
+                cpy[obj_key.lower()] = obj[obj_key]
+            else:
+                cpy[str(obj_key)] = obj[obj_key]
+        obj = cpy
+
+        result = best_match_object_access(obj, key.lower(), False, False)
+        if result is not None:
+            return result
+
+    if search_in_keys:
+        for obj_key in obj:
+            # Ensure obj_key is a string before calling lower()
+            str_obj_key = str(obj_key) if not isinstance(obj_key, str) else obj_key
+            if key.lower() in str_obj_key.lower():
+                return obj[obj_key]
+    
+    return None
+
+
+def prepare_schema(schema: Union[str, Dict], case_insensitive: bool = False) -> Tuple[Dict, Dict]:
+    # Function to recursively replace string type names with actual type objects
+    # and optionally convert keys to lowercase
+    def process_schema_case(obj):
+        new_obj = [] if isinstance(obj, list) else {}
+        if isinstance(obj, dict):
+            for key in obj:
+                # Ensure key is a string before calling lower()
+                str_key = str(key) if not isinstance(key, str) else key
+                new_key = str_key.lower() if case_insensitive else str_key
+                if isinstance(obj[key], (dict, list)) and obj[key] is not None:
+                    new_obj[new_key] = process_schema_case(obj[key])
+                else:
+                    new_obj[new_key] = obj[key]
+        elif isinstance(obj, list):
+            new_obj = [process_schema_case(item) for item in obj]
+        else:
+            new_obj = obj
+        return new_obj
+
+    def process_schema_value(obj):
+        new_obj = [] if isinstance(obj, list) else {}
+        if isinstance(obj, dict):
+            for key in obj:
+                new_key = key
+                if isinstance(obj[key], str):
+                    type_mapping = {
+                        'number': float,
+                        'string': str,
+                        'boolean': bool,
+                        'object': dict,
+                    }
+                    new_obj[new_key] = type_mapping.get(obj[key].lower(), obj[key])
+                elif isinstance(obj[key], (dict, list)) and obj[key] is not None:
+                    new_obj[new_key] = process_schema_value(obj[key])
+                else:
+                    new_obj[new_key] = obj[key]
+        elif isinstance(obj, list):
+            new_obj = [process_schema_value(item) for item in obj]
+        else:
+            new_obj = obj
+        return new_obj
+
+    parsed_schema = None
+    schema_case_processed = None
+    schema_value_processed = None
+    
+    # Check if schema is a string
+    if isinstance(schema, str):
+        try:
+            # Parse the string as JSON
+            parsed_schema = parse_relaxed_json(schema)
+        except Exception as error:
+            raise ValueError(f'Invalid schema string: {str(error)}')
+    else:
+        parsed_schema = schema
+    
+    # Clone the schema to avoid modifying the original
+    cloned_schema = copy.deepcopy(parsed_schema)
+    schema_value_processed = process_schema_value(cloned_schema)
+    schema_case_processed = process_schema_case(schema_value_processed) if case_insensitive else schema_value_processed
+    return cloned_schema, schema_case_processed 
+
+def deep_transform_leaf_maps(obj: Any, callback) -> Any:
+    if isinstance(obj, dict) and hasattr(obj, 'get') and obj.get('__is_map__'):
+        return callback(obj)
+
+    if not isinstance(obj, (dict, list)) or obj is None:
+        return obj
+
+    if isinstance(obj, list):
+        return [deep_transform_leaf_maps(item, callback) for item in obj]
+
+    result = {}
+    for key in obj:
+        result[key] = deep_transform_leaf_maps(obj[key], callback)
+    return result
+
+
+def map_to_object(map_obj: Dict) -> Dict:
+    # In Python, we'll just use regular dicts instead of Maps
+    return map_obj
+
+
+def get_leaf_paths(schema: Dict, current_path: str = '') -> List[str]:
+    leaf_paths = []
+
+    def traverse(obj, path):
+        if not isinstance(obj, (dict, list)) or obj is None:
+            return
+
+        if isinstance(obj, dict):
+            for key in obj:
+                new_path = f"{path}.{key}" if path else key
+                value = obj[key]
+
+                if isinstance(value, list):
+                    if all(not isinstance(item, (dict, list)) for item in value):
+                        leaf_paths.append(new_path)
+                    else:
+                        for item in value:
+                            traverse(item, new_path)
+                elif isinstance(value, dict) and value is not None:
+                    traverse(value, new_path)
+                else:
+                    leaf_paths.append(new_path)
+
+    traverse(schema, current_path)
+    return leaf_paths
+
+
+def get_all_path_of_object_arrays_sorted_by_depth(schema: Dict) -> List[str]:
+    paths = []
+
+    def traverse(obj, current_path=""):
+        if isinstance(obj, dict):
+            for key in obj:
+                new_path = f"{current_path}.{key}" if current_path else key
+                value = obj[key]
+
+                if isinstance(value, list):
+                    if len(value) > 0 and isinstance(value[0], dict) and value[0] is not None:
+                        paths.append(new_path)
+                        traverse(value[0], new_path)
+                elif isinstance(value, dict) and value is not None:
+                    traverse(value, new_path)
+
+    traverse(schema)
+    paths.sort(key=lambda x: len(x.split('.')))
+    return paths
+
+
+def LOG(*args):
+    # Logging function - disabled by default like in TypeScript
+    pass
+
+
+def parse_json(json_string: str, schema: Dict, case_insensitive: bool = True, best_match_attribute: bool = True) -> Dict:
+    """
+    Predicts dot-paths associated with each line in a JSON string based on a given schema.
+
+    Args:
+        json_string: The JSON string to process.
+        schema: The schema defining the structure of the JSON.
+        case_insensitive: Whether to use case insensitive matching.
+        best_match_attribute: Whether to use best match for attributes.
+
+    Returns:
+        Object containing all possible dot-path line mappings and leaf node paths.
+    """
+    # START 
+    # 1. preprocess json and schema
+    json_string = prepare_json(json_string)
+    original_schema, processed_schema = prepare_schema(schema, case_insensitive)
+    schema = processed_schema
+    
+    # 2. predict lines attributes
+    pairs, known_attributes = predict_lines_attributes(json_string, schema, case_insensitive, best_match_attribute)
+
+    # 3. map lines to dot-path
+    path_mapping = build_path_predictions_mapping(schema)
+    LOG(f"pathMapping: {path_mapping}")
+    
+    stack = [{
+        'currentPath': "",
+        'currentResult': [],
+        'position': 0,
+        'forkId': 0
+    }]
+
+    all_results = []
+    leaf_nodes_paths = get_leaf_paths(schema)
+
+    # prepare pairs by removing all pairs with empty attribute at the start
+    while len(pairs) > 0 and pairs[0][1] == "":
+        pairs.pop(0)
+
+    def declare_result(push_result):
+        explored_leafs_count = len(push_result)
+        if explored_leafs_count == 0:
+            return explored_leafs_count
+        if len(all_results) == 0:
+            all_results.append({'result': push_result, 'exploredLeafsCount': explored_leafs_count})
+            return explored_leafs_count
+        
+        i = 0
+        while i < len(all_results) and explored_leafs_count < all_results[i]['exploredLeafsCount']:
+            i += 1
+        if i == 0:
+            all_results.insert(i, {'result': push_result, 'exploredLeafsCount': explored_leafs_count})
+            return explored_leafs_count
+        return 0
+
+    LOG(f"pairs: {pairs}")
+    
+    while len(stack) > 0:  # DFS 
+        current_state = stack.pop()
+        current_path = current_state['currentPath']
+        current_result = current_state['currentResult']
+        position = current_state['position']
+        fork_id = current_state['forkId']
+        
+        while position < len(pairs):
+            line, attr = pairs[position]
+            LOG(f'Processing line: "{line}", attribute: "{attr}", forkId: {fork_id}')
+            
+            if attr == "":  # empty attribute nothing to predict
+                LOG(f'Empty attribute, pushing line with current dot-path: "{current_path}", forkId: {fork_id}')
+                current_result.append({
+                    'path': current_path or "undefined",
+                    'line': line,
+                    'arrayResolvedPath': current_path or "undefined",
+                    'attr': attr or ""
+                })
+                position += 1
+                continue
+
+            if current_path not in path_mapping:
+                LOG(f"Unexpected dot-path: {current_path}, forkId: {fork_id}")
+                if fork_id:
+                    pass  # break in original
+
+            possible_attrs = path_mapping.get(current_path, {})
+            possible_paths = possible_attrs.get(attr)
+            
+            if not isinstance(possible_paths, list):
+                if best_match_attribute:
+                    LOG(f'Will search for best match attribute because attribute: "{attr}" is not found, forkId: {fork_id}')
+                    possible_paths = best_match_object_access(possible_attrs, attr)
+                if not isinstance(possible_paths, list):
+                    possible_paths = []
+                    LOG(f"Invalid possiblePaths: expected array but got {type(possible_paths)}, forkId: {fork_id}")
+                    if fork_id:
+                        pass  # break in original
+
+            # filter possible paths by being legitimate or not
+            filtered_paths = []
+            for new_path in possible_paths:
+                picked_before = any(result['path'] == new_path for result in current_result)
+                processing_array = has_array_ancestor(current_path, schema)
+                is_being_processed_in_parallel = any(
+                    result['result'][position]['forkId'] != fork_id and result['result'][position]['path'] == new_path
+                    for result in all_results if position < len(result['result'])
+                )
+                should_not_pick = (picked_before and not processing_array) or is_being_processed_in_parallel
+                LOG(f"newpath: {new_path}, pickedBefore: {picked_before}, processingArray: {processing_array}, isBeingProcessedInParallel: {is_being_processed_in_parallel}, shouldNotPick: {should_not_pick}, forkId: {fork_id}")
+                if not should_not_pick:
+                    filtered_paths.append(new_path)
+
+            possible_paths = filtered_paths
+            # sort by deepest first
+            possible_paths.sort(key=lambda x: len(x.split('.')), reverse=True)
+            
+            LOG(f"at dot-path {current_path} found {len(possible_paths)} possible paths: {possible_paths}, forkId: {fork_id}")
+            
+            # fork other choices computations
+            child_fork_id = fork_id + 1
+            for i in range(1, len(possible_paths)):
+                new_path = possible_paths[i]
+                LOG(f'Will try later path: "{new_path}" with forkId: {child_fork_id} and position: {position}, this fork id is: {fork_id}')
+                new_result = current_result.copy()
+                new_result.append({
+                    'path': new_path or "undefined",
+                    'line': line,
+                    'arrayResolvedPath': new_path or "undefined",
+                    'attr': attr or ""
+                })
+                stack.append({
+                    'currentPath': new_path,
+                    'currentResult': new_result,
+                    'position': position + 1,
+                    'forkId': child_fork_id
+                })
+                child_fork_id += 1
+
+            # this fork takes first choice
+            picked_path = possible_paths[0] if possible_paths else None
+            if picked_path:
+                current_result.append({
+                    'path': picked_path or "undefined",
+                    'line': line,
+                    'arrayResolvedPath': picked_path or "undefined",
+                    'attr': attr or ""
+                })
+                current_path = picked_path
+            else:
+                LOG(f'No valid dot-paths found for attribute "{attr}" at dot-path: {current_path}, forkId: {fork_id}')
+                current_result.append({
+                    'path': current_path or "undefined",
+                    'line': line,
+                    'arrayResolvedPath': current_path or "undefined",
+                    'attr': attr or ""
+                })
+                if fork_id:
+                    declare_result(current_result)
+                    break  # break in original
+            position += 1
+
+        if position == len(pairs) or fork_id == 0:
+            if declare_result(current_result) and fork_id:
+                break
+
+    # 4. join pairs that are successive and share the same dot-path
+    for result_obj in all_results:
+        result = result_obj['result']
+        joined_result = []
+        last_path = None
+        accumulated_lines = ""
+        last_attr = ""
+
+        for item in result:
+            path, line, attr = item['path'], item['line'], item['attr']
+            if path == last_path:
+                accumulated_lines += line
+            else:
+                if last_path is not None:
+                    joined_result.append({
+                        'path': last_path or "undefined",
+                        'line': accumulated_lines,
+                        'arrayResolvedPath': last_path or "undefined",
+                        'attr': last_attr or ""
+                    })
+                last_path = path
+                accumulated_lines = line
+                last_attr = attr
+
+        if last_path is not None:
+            joined_result.append({
+                'path': last_path or "undefined",
+                'line': accumulated_lines,
+                'arrayResolvedPath': last_path or "undefined",
+                'attr': last_attr or ""
+            })
+        result_obj['result'] = joined_result
+
+    LOG(f"joinedResults: {all_results}")
+
+    # 5. Filter out non-leaf node dot-paths for each result
+    for result_obj in all_results:
+        result = result_obj['result']
+        result_obj['result'] = [item for item in result if item['path'] in leaf_nodes_paths]
+
+    # 6. sort all results by the number of leaf dot-paths they explore
+    all_results.sort(key=lambda x: len(x['result']), reverse=True)
+
+    # 7. process arrays
+    array_paths_to_process = get_all_path_of_object_arrays_sorted_by_depth(schema)
+
+    for result_obj in all_results:
+        result = result_obj['result']
+        for array_path in array_paths_to_process:
+            index_counter = -1
+            first_element_path = None
+            seen_paths = set()
+
+            new_result = []
+            for item in result:
+                path = item['path']
+                line = item['line']
+                array_resolved_path = item['arrayResolvedPath']
+                attr = item['attr']
+                
+                if path.startswith(array_path):
+                    if first_element_path is None:
+                        first_element_path = path
+                        index_counter = 0
+                        seen_paths.add(path)
+                    elif path == first_element_path:
+                        if path in seen_paths:
+                            index_counter += 1
+                            seen_paths.clear()
+                        seen_paths.add(path)
+                    else:
+                        seen_paths.add(path)
+
+                    parts = array_resolved_path.split('.')
+                    array_path_parts = array_path.split('.')
+                    new_resolved_path = []
+                    for i, part in enumerate(parts):
+                        if i == len(array_path_parts) - 1:
+                            new_resolved_path.append(f"{part}[{index_counter}]")
+                        else:
+                            new_resolved_path.append(part)
+                    new_resolved_path = '.'.join(new_resolved_path)
+                    
+                    new_result.append({
+                        'path': path or "undefined",
+                        'line': line,
+                        'arrayResolvedPath': new_resolved_path or "undefined",
+                        'attr': attr
+                    })
+                elif first_element_path:
+                    first_element_path = None
+                    index_counter = -1
+                    seen_paths.clear()
+                    new_result.append({
+                        'path': path or "undefined",
+                        'line': line,
+                        'arrayResolvedPath': array_resolved_path,
+                        'attr': attr
+                    })
+                else:
+                    new_result.append({
+                        'path': path or "undefined",
+                        'line': line,
+                        'arrayResolvedPath': array_resolved_path,
+                        'attr': attr
+                    })
+            result = new_result
+        result_obj['result'] = result
+
+    # 8. convert to json shape
+    for result_obj in all_results:
+        result = result_obj['result']
+        parsed_object = {}
+        
+        for item in result:
+            path = item['path']
+            line = item['line']
+            array_resolved_path = item['arrayResolvedPath']
+            attr = item['attr']
+            
+            type_name = extract_type_from_schema(schema, path)
+            
+            # Simulate lodash _.set behavior
+            keys = array_resolved_path.split('.')
+            current = parsed_object
+            for i, key in enumerate(keys[:-1]):
+                # Handle array notation like key[0]
+                if '[' in key and ']' in key:
+                    base_key = key[:key.index('[')]
+                    index = int(key[key.index('[') + 1:key.index(']')])
+                    if base_key not in current:
+                        current[base_key] = []
+                    while len(current[base_key]) <= index:
+                        current[base_key].append({})
+                    current = current[base_key][index]
+                else:
+                    if key not in current:
+                        current[key] = {}
+                    current = current[key]
+            
+            # Set the final value
+            final_key = keys[-1]
+            if '[' in final_key and ']' in final_key:
+                base_key = final_key[:final_key.index('[')]
+                index = int(final_key[final_key.index('[') + 1:final_key.index(']')])
+                if base_key not in current:
+                    current[base_key] = []
+                while len(current[base_key]) <= index:
+                    current[base_key].append(None)
+                current[base_key][index] = {
+                    '__is_map__': True,
+                    'line': line,
+                    'path': path,
+                    'arrayResolvedPath': array_resolved_path,
+                    'typeName': type_name,
+                    'attr': attr
+                }
+            else:
+                current[final_key] = {
+                    '__is_map__': True,
+                    'line': line,
+                    'path': path,
+                    'arrayResolvedPath': array_resolved_path,
+                    'typeName': type_name,
+                    'attr': attr
+                }
+        
+        result_obj['result'] = parsed_object
+
+    # 9. map object to schema case if needed
+    if case_insensitive or best_match_attribute:
+        for result_obj in all_results:
+            result = result_obj['result']
+            result_obj['result'] = map_object_to_schema_case(result, original_schema)
+
+    # 10. parse values
+    for result_obj in all_results:
+        result = result_obj['result']
+        
+        def parse_leaf_map(leaf_map):
+            if not isinstance(leaf_map, dict) or not leaf_map.get('__is_map__'):
+                return leaf_map
+                
+            type_name = leaf_map.get("typeName")
+            line = leaf_map.get("line")
+            attr_name = leaf_map.get("attr")
+            parser = get_js_type_parser(type_name)
+            value = None
+            if parser:
+                value = parser(line, attr_name, known_attributes)
+            return value
+        
+        result_obj['result'] = deep_transform_leaf_maps(result, parse_leaf_map)
+
+    return {'allResults': all_results, 'LeaftNodesPaths': leaf_nodes_paths} 
